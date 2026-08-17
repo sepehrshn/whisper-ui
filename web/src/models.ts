@@ -21,6 +21,7 @@ export type TranscriptResult = {
   language: string | null;
   model: string;
   task: string;
+  provider?: string;
   device?: string;
   segments: TranscriptSegment[];
 };
