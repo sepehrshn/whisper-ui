@@ -1,0 +1,17 @@
+node_modules
+dist
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+uploads
+*.wav
+*.mp3
+*.m4a
+*.flac
+.cache
+server/uploads
+server/.numba_cache
+server/_repro.py

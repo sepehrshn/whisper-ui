@@ -1,0 +1,7 @@
+openai-whisper
+fastapi
+uvicorn[standard]
+python-multipart
+# Do not install the default PyPI torch wheel here — it is CPU-only.
+# After `pip install -r requirements.txt`, install CUDA torch:
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
