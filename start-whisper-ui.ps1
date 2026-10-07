@@ -4,7 +4,7 @@ $server = Join-Path $root "server"
 $venvPython = Join-Path $server ".venv\Scripts\python.exe"
 
 if (-not (Test-Path $venvPython)) {
-    Write-Host "First launch — setting up Whisper UI..." -ForegroundColor Cyan
+    Write-Host "First launch - setting up Whisper UI..." -ForegroundColor Cyan
     & (Join-Path $root "install-whisper-ui.ps1")
 }
 
