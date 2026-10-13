@@ -1,6 +1,6 @@
 # Whisper UI
 
-Desktop speech-to-text app for Windows — **local Whisper** (GPU/RAM) or **cloud APIs** (OpenAI, Deepgram, AssemblyAI).
+Desktop speech-to-text app for Windows — **local Whisper** (GPU/RAM) or **cloud APIs** (OpenAI, AvalAI, Deepgram, AssemblyAI).
 
 ## Install on Windows
 
@@ -37,7 +37,7 @@ Opens in a dedicated **app window** (Edge/Chrome app mode) at `http://127.0.0.1:
 
 ## API keys
 
-Open **Settings → API keys** and paste keys for OpenAI, Deepgram, or AssemblyAI. Keys never leave your PC.
+Open **Settings → API keys** and paste keys for OpenAI, AvalAI, Deepgram, or AssemblyAI. Keys never leave your PC. AvalAI uses the OpenAI-compatible endpoint `https://api.avalai.ir/v1`.
 
 ## Build standalone exe (advanced)
 

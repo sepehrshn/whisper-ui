@@ -6,6 +6,7 @@ import {
   fetchSettings,
   installDependencies,
   saveApiKey,
+  saveDefaultProvider,
   transcribeAudio,
   type DependencyReport,
   type ProviderInfo,
@@ -86,11 +87,14 @@ function appendChunk(current: string, text: string): string {
 }
 
 function liveModelId(): string {
-  return MODELS.some((model) => model.id === selectedModel) ? selectedModel : "small";
+  const models = providerModels();
+  if (models.some((model) => model.id === selectedModel)) return selectedModel;
+  return models.find((model) => model.recommended)?.id ?? models[0]?.id ?? "small";
 }
 
 function liveModelLabel(): string {
-  return MODELS.find((model) => model.id === liveModelId())?.label ?? liveModelId();
+  const models = providerModels();
+  return models.find((model) => model.id === liveModelId())?.label ?? liveModelId();
 }
 
 function liveDeviceLabel(): string {
@@ -228,7 +232,7 @@ function renderTranscribeView(): string {
       </div>
     </div>` : ""}
     <div class="panel">
-      <div class="panel-head"><div><h2>API keys</h2><p>Add OpenAI, Deepgram, or AssemblyAI keys in Settings.</p></div></div>
+      <div class="panel-head"><div><h2>API keys</h2><p>Add OpenAI, AvalAI, Deepgram, or AssemblyAI keys in Settings.</p></div></div>
       <p style="margin:0;color:var(--muted);font-size:13px">Open <button class="chip active" type="button" data-goto="settings" style="cursor:pointer">Settings</button> → API keys, paste a key, then Save.</p>
     </div>
   `;
@@ -245,12 +249,13 @@ function renderLiveView(): string {
       <p>Speak into the microphone. Transcript and translation appear as you talk.</p>
     </div>
     ${microphoneCount === 0 ? `<div class="banner-inline error">No microphone is connected. Plug one in, or enable it under Windows Settings, System, Sound, Input.</div>` : ""}
-    ${selectedProvider !== "local" ? `<div class="banner-inline info">Live speech uses Local Whisper (${escapeHtml(modelLabel)}) on ${deviceLabel}. Cloud engines still apply to file transcription.</div>` : ""}
     <div class="panel">
       <div class="panel-head">
         <div>
           <h2>Microphone</h2>
-          <p>Local Whisper · ${escapeHtml(modelLabel)} · ${deviceLabel}</p>
+          <p>${selectedProvider === "local"
+            ? `Local Whisper · ${escapeHtml(modelLabel)} · ${deviceLabel}`
+            : `${escapeHtml(currentProvider()?.name ?? "Cloud API")} · ${escapeHtml(modelLabel)}`}</p>
         </div>
       </div>
       <div class="field-row">
@@ -265,7 +270,9 @@ function renderLiveView(): string {
           </select>
         </label>
       </div>
-      <p class="hint-text">The browser uses this PC's microphone. English translates on this PC. Any other language needs an OpenAI key in Settings.</p>
+      <p class="hint-text">${selectedProvider === "local"
+        ? "The browser uses this PC's microphone. English translates on this PC. Any other language needs an OpenAI or AvalAI key in Settings."
+        : "Microphone audio is sent to the selected cloud API in short clips. Local Whisper is not loaded."}</p>
       <div class="live-stream ${liveActive ? "on" : ""}">
         <div id="live-meter" class="live-meter" aria-hidden="true">${Array.from({ length: 28 }, () => "<span></span>").join("")}</div>
         <p id="live-meter-label">${liveMeterLabel()}</p>
@@ -306,7 +313,7 @@ function renderSettingsView(): string {
     </div>
 
     <div class="panel" id="api-keys-panel">
-      <div class="panel-head"><div><h2>API keys</h2><p>Paste a key here to use OpenAI, Deepgram, or AssemblyAI. Keys stay on this PC.</p></div></div>
+      <div class="panel-head"><div><h2>API keys</h2><p>Paste a key here to use OpenAI, AvalAI, Deepgram, or AssemblyAI. Keys stay on this PC.</p></div></div>
       ${cloudProviders.length ? cloudProviders.map((provider) => `
         <form class="settings-card ${provider.id === selectedProvider ? "active-key" : ""}" data-key-provider="${provider.id}">
           <div><strong>${escapeHtml(provider.name)}</strong><span class="pill ${provider.configured ? "" : "muted"}">${provider.configured ? "Configured" : "Not set"}</span><p>${escapeHtml(provider.description)}</p></div>
@@ -671,6 +678,14 @@ async function startLive(context: AudioContext): Promise<void> {
     void context.close();
     return;
   }
+  const provider = currentProvider();
+  if (provider?.requiresApiKey && !provider.configured) {
+    void context.close();
+    setStatus(`Add a ${provider.name} API key in Settings.`, "error");
+    activeView = "settings";
+    render();
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia) {
     void context.close();
     setStatus("This page cannot use the microphone. Open Whisper UI in the browser at 127.0.0.1.", "error");
@@ -736,6 +751,7 @@ async function startLive(context: AudioContext): Promise<void> {
     socket.addEventListener("open", () => {
       socket.send(JSON.stringify({
         type: "start",
+        provider: selectedProvider,
         model: liveModelId(),
         language: liveSourceLanguage,
         targetLanguage: liveTargetLanguage,
@@ -821,10 +837,11 @@ function bindEvents(): void {
       }
       try {
         await saveApiKey(provider, apiKey);
+        await saveDefaultProvider(provider);
         await refreshProviders(false);
         selectedProvider = provider;
         syncModelForProvider();
-        setStatus(`${currentProvider()?.name ?? provider} API key saved.`, "ok");
+        setStatus(`${currentProvider()?.name ?? provider} API key saved. Using this engine.`, "ok");
         render();
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "Could not save key", "error");
@@ -850,16 +867,27 @@ function bindEvents(): void {
 
   document.querySelectorAll<HTMLButtonElement>("[data-provider]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      selectedProvider = btn.dataset.provider ?? "local";
-      syncModelForProvider();
-      const provider = currentProvider();
-      const needsKey = Boolean(provider?.requiresApiKey && !provider.configured);
-      if (needsKey) {
-        setStatus(`Paste a ${provider?.name} API key in the API keys section, then Save.`, "info");
-      } else {
-        setStatus(`Engine: ${provider?.name ?? selectedProvider}`, "ok");
-      }
-      render();
+      void (async () => {
+        selectedProvider = btn.dataset.provider ?? "local";
+        syncModelForProvider();
+        const provider = currentProvider();
+        try {
+          await saveDefaultProvider(selectedProvider);
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Could not save engine", "error");
+          render();
+          return;
+        }
+        const needsKey = Boolean(provider?.requiresApiKey && !provider.configured);
+        if (needsKey) {
+          setStatus(`Paste a ${provider?.name} API key in the API keys section, then Save.`, "info");
+        } else if (selectedProvider === "local") {
+          setStatus("Engine: Local Whisper", "ok");
+        } else {
+          setStatus(`Engine: ${provider?.name ?? selectedProvider}. Local Whisper will not be loaded.`, "ok");
+        }
+        render();
+      })();
     });
   });
 

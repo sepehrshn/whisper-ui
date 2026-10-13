@@ -19,7 +19,7 @@ from dependencies import dependency_report, install_dependencies
 from providers.registry import get_provider, list_providers, provider_ready
 from settings import delete_api_key, public_settings, set_api_key, set_default_provider
 from stream_session import StreamSession
-from transcribe_local import ALLOWED_MODELS, ALLOWED_TASKS, gpu_info, loaded_model_info
+from transcribe_local import ALLOWED_MODELS, ALLOWED_TASKS, gpu_info, loaded_model_info, unload_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("whisper-ui")
@@ -92,7 +92,7 @@ def settings():
 
 @app.put("/api/settings/keys")
 def update_api_key(body: ApiKeyUpdate):
-    allowed = {"openai", "deepgram", "assemblyai"}
+    allowed = {"openai", "avalai", "deepgram", "assemblyai"}
     if body.provider not in allowed:
         raise HTTPException(status_code=400, detail=f"Unknown provider: {body.provider}")
     if body.apiKey.strip():
@@ -105,8 +105,14 @@ def update_api_key(body: ApiKeyUpdate):
 
 @app.put("/api/settings/default-provider")
 def update_default_provider(body: DefaultProviderUpdate):
+    try:
+        engine = get_provider(body.provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     set_default_provider(body.provider)
-    return {"ok": True, "defaultProvider": body.provider}
+    if body.provider != "local":
+        unload_model()
+    return {"ok": True, "defaultProvider": body.provider, "engine": engine.name}
 
 
 @app.get("/api/models")
@@ -139,6 +145,9 @@ async def transcribe(
             status_code=400,
             detail=f"{engine.name} API key is not configured. Open Settings and add your key.",
         )
+
+    if provider != "local":
+        unload_model()
 
     if provider == "local":
         if model not in ALLOWED_MODELS:
@@ -271,6 +280,7 @@ async def _run_live_stream(websocket: WebSocket) -> None:
                             language=str(payload.get("language", "")),
                             target_language=str(payload.get("targetLanguage", "")),
                             device=str(payload.get("device", "auto")),
+                            provider=str(payload.get("provider", "local")),
                         )
                     except ValueError as exc:
                         await _send_stream(websocket, {"type": "error", "text": str(exc)})
@@ -305,11 +315,14 @@ async def _run_live_stream(websocket: WebSocket) -> None:
                         "text": "Live transcription fell behind. Some audio was skipped.",
                     })
                 while session.ready() and not finished:
-                    status = (
-                        "Transcribing… loading Whisper. The first phrase can take a minute."
-                        if not model_loaded
-                        else "Transcribing…"
-                    )
+                    if session.provider_id != "local":
+                        status = f"Sending audio to {session.engine_name}…"
+                    else:
+                        status = (
+                            "Transcribing… loading Whisper. The first phrase can take a minute."
+                            if not model_loaded
+                            else "Transcribing…"
+                        )
                     model_loaded = True
                     if not await _send_stream(websocket, {"type": "status", "text": status}):
                         finished = True

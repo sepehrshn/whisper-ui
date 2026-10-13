@@ -50,6 +50,19 @@ PROVIDER_DEFINITIONS: list[dict[str, Any]] = [
         ],
     },
     {
+        "id": "avalai",
+        "name": "AvalAI API",
+        "requiresApiKey": True,
+        "description": "OpenAI-compatible cloud transcription via AvalAI.",
+        "models": [
+            {"id": "whisper-1", "label": "Whisper v1", "recommended": True},
+            {"id": "gpt-4o-mini-transcribe", "label": "GPT-4o Mini Transcribe"},
+            {"id": "gpt-4o-transcribe", "label": "GPT-4o Transcribe"},
+            {"id": "groq.whisper-large-v3-turbo", "label": "Groq Whisper Large v3 Turbo"},
+            {"id": "groq.whisper-large-v3", "label": "Groq Whisper Large v3"},
+        ],
+    },
+    {
         "id": "deepgram",
         "name": "Deepgram",
         "requiresApiKey": True,
@@ -91,6 +104,10 @@ def get_provider(provider_id: str):
         from providers.openai_api import OpenAIProvider
 
         return OpenAIProvider()
+    if provider_id == "avalai":
+        from providers.avalai import AvalAIProvider
+
+        return AvalAIProvider()
     if provider_id == "deepgram":
         from providers.deepgram import DeepgramProvider
 

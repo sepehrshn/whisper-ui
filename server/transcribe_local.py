@@ -221,6 +221,20 @@ def get_model(name: str, device: torch.device):
         return _current_model
 
 
+def unload_model() -> None:
+    global _current_name, _current_device, _current_model
+    with _model_lock:
+        if _current_model is None:
+            return
+        logger.info("Unloading local Whisper model %s", _current_name)
+        del _current_model
+        _current_model = None
+        _current_name = None
+        _current_device = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def run_transcribe(
     audio: np.ndarray,
     model_name: str,

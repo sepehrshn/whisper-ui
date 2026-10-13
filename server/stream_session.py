@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import logging
+import tempfile
+import wave
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
 import numpy as np
 
-from providers.openai_api import LANGUAGE_NAMES, translate_text
+from providers.avalai import translate_text as translate_text_avalai
+from providers.openai_api import LANGUAGE_NAMES, translate_text as translate_text_openai
+from providers.registry import get_provider, provider_ready
 from settings import get_api_key
-from transcribe_local import ALLOWED_MODELS, run_transcribe
+from transcribe_local import ALLOWED_MODELS, run_transcribe, unload_model
 
 logger = logging.getLogger("whisper-ui.stream")
 
@@ -70,21 +75,57 @@ def _join(left: str, right: str) -> str:
     return left or right
 
 
-class StreamSession:
-    """Chunk microphone PCM through local Whisper, then translate committed text."""
+def _write_wav(audio: np.ndarray) -> Path:
+    pcm = np.clip(np.asarray(audio, dtype=np.float32) * 32768.0, -32768, 32767).astype("<i2")
+    handle = tempfile.NamedTemporaryFile(prefix="whisper-live-", suffix=".wav", delete=False)
+    path = Path(handle.name)
+    handle.close()
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(pcm.tobytes())
+    return path
 
-    def __init__(self, model: str, language: str, target_language: str, device: str):
+
+class StreamSession:
+    """Chunk microphone PCM through the selected engine, then translate committed text."""
+
+    def __init__(
+        self,
+        model: str,
+        language: str,
+        target_language: str,
+        device: str,
+        provider: str = "local",
+    ):
         self.model = model.strip()
         self.language = language.strip()
         self.device = (device or "auto").strip().lower()
+        self.provider_id = (provider or "local").strip().lower()
         self.target = target_language.strip().lower()
         if self.target in {"none", "off", "transcript"}:
             self.target = ""
 
-        if self.model not in ALLOWED_MODELS:
-            raise ValueError(f"Unknown model: {self.model}")
-        if self.device not in ALLOWED_DEVICES:
-            raise ValueError(f"Unknown device: {self.device}")
+        try:
+            self._engine = get_provider(self.provider_id)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        self.engine_name = self._engine.name
+
+        if self.provider_id == "local":
+            if self.model not in ALLOWED_MODELS:
+                raise ValueError(f"Unknown model: {self.model}")
+            if self.device not in ALLOWED_DEVICES:
+                raise ValueError(f"Unknown device: {self.device}")
+        else:
+            if self._engine.requires_api_key and not provider_ready(self.provider_id):
+                raise ValueError(f"{self.engine_name} API key is not configured. Add it in Settings.")
+            allowed = {item["id"] for item in self._engine.models}
+            if self.model not in allowed:
+                raise ValueError(f"Unknown {self.engine_name} model: {self.model}")
+            unload_model()
+
         if self.target and self.target not in LANGUAGE_NAMES:
             raise ValueError(f"Unknown target language: {self.target}")
 
@@ -97,20 +138,31 @@ class StreamSession:
         self._translation_failed = False
         self._fell_behind = False
 
-        self._use_openai = bool(self.target) and bool(get_api_key("openai"))
-        self._use_whisper_translate = self.target == "en" and not self._use_openai
-        self._translation_blocked = bool(self.target) and not self._use_openai and not self._use_whisper_translate
+        self._cloud_translate = None
+        if self.target:
+            if self.provider_id == "avalai" and get_api_key("avalai"):
+                self._cloud_translate = translate_text_avalai
+            elif self.provider_id == "openai" and get_api_key("openai"):
+                self._cloud_translate = translate_text_openai
+            elif get_api_key("openai"):
+                self._cloud_translate = translate_text_openai
+            elif get_api_key("avalai"):
+                self._cloud_translate = translate_text_avalai
+        self._use_whisper_translate = (
+            self.provider_id == "local" and self.target == "en" and not self._cloud_translate
+        )
+        self._translation_blocked = bool(self.target) and not self._cloud_translate and not self._use_whisper_translate
         self._blocked_message = ""
         if self._use_whisper_translate and self.model.endswith(".en"):
             self._use_whisper_translate = False
             self._translation_blocked = True
             self._blocked_message = (
                 "This English-only model cannot translate. "
-                "Choose a multilingual model, or add an OpenAI key in Settings."
+                "Choose a multilingual model, or add an OpenAI or AvalAI key in Settings."
             )
         elif self._translation_blocked:
             name = LANGUAGE_NAMES.get(self.target, self.target)
-            self._blocked_message = f"Add an OpenAI key in Settings to translate into {name}."
+            self._blocked_message = f"Add an OpenAI or AvalAI key in Settings to translate into {name}."
 
     def start_events(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = [{"type": "ready"}]
@@ -218,23 +270,37 @@ class StreamSession:
         return events
 
     def _transcribe_window(self, window: np.ndarray) -> tuple[str, str]:
-        result = run_transcribe(window, self.model, "transcribe", self.language, self.device)
-        text = str(result.get("text", "")).strip()
-        english = ""
-        if self._use_whisper_translate:
-            translated = run_transcribe(window, self.model, "translate", self.language, self.device)
-            english = str(translated.get("text", "")).strip()
-        return text, english
+        if self.provider_id == "local":
+            result = run_transcribe(window, self.model, "transcribe", self.language, self.device)
+            text = str(result.get("text", "")).strip()
+            english = ""
+            if self._use_whisper_translate:
+                translated = run_transcribe(window, self.model, "translate", self.language, self.device)
+                english = str(translated.get("text", "")).strip()
+            return text, english
+
+        path = _write_wav(window)
+        try:
+            result = self._engine.transcribe(
+                path,
+                model=self.model,
+                task="transcribe",
+                language=self.language,
+                device="cloud",
+            )
+        finally:
+            path.unlink(missing_ok=True)
+        return str(result.get("text", "")).strip(), ""
 
     def _translation_events(self, source_text: str, english_text: str) -> list[dict[str, Any]]:
         if not self.target or self._translation_blocked or self._translation_failed:
             return []
-        if self._use_openai:
+        if self._cloud_translate:
             source_text = source_text.strip()
             if not source_text:
                 return []
             try:
-                translated = translate_text(source_text, self.target)
+                translated = self._cloud_translate(source_text, self.target)
             except Exception as exc:
                 logger.warning("Live translation failed: %s", exc)
                 self._translation_failed = True

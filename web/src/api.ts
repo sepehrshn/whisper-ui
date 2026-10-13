@@ -74,6 +74,18 @@ export async function fetchSettings(): Promise<AppSettings> {
   return response.json();
 }
 
+export async function saveDefaultProvider(provider: string): Promise<void> {
+  const response = await fetch("/api/settings/default-provider", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider }),
+  });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(payload.detail ?? "Could not save engine");
+  }
+}
+
 export async function saveApiKey(provider: string, apiKey: string): Promise<AppSettings> {
   const response = await fetch("/api/settings/keys", {
     method: "PUT",
