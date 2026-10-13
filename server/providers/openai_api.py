@@ -8,6 +8,74 @@ from typing import Any
 
 from settings import get_api_key
 
+LANGUAGE_NAMES = {
+    "en": "English",
+    "fa": "Persian",
+    "ar": "Arabic",
+    "zh": "Chinese",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "hi": "Hindi",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "tr": "Turkish",
+}
+
+
+def translate_text(text: str, target_language: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    api_key = get_api_key("openai")
+    if not api_key:
+        raise RuntimeError("OpenAI API key is not configured. Add it in Settings.")
+
+    code = target_language.strip().lower()
+    target_name = LANGUAGE_NAMES.get(code, code or "English")
+    body = {
+        "model": "gpt-4o-mini",
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    f"Translate the user's speech transcript into {target_name}. "
+                    "Return only the translation, with no quotes or explanation. "
+                    f"If the text is already in {target_name}, return it unchanged."
+                ),
+            },
+            {"role": "user", "content": cleaned},
+        ],
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(detail_body).get("error", {}).get("message", detail_body)
+        except json.JSONDecodeError:
+            detail = detail_body or exc.reason
+        raise RuntimeError(f"OpenAI API error: {detail}") from exc
+
+    message = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if isinstance(message, list):
+        message = "".join(str(part.get("text", "")) for part in message if isinstance(part, dict))
+    return str(message).strip()
+
 
 class OpenAIProvider:
     id = "openai"

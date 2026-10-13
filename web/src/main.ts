@@ -10,9 +10,22 @@ import {
   type DependencyReport,
   type ProviderInfo,
 } from "./api.ts";
-import { LANGUAGES, MODELS, type TranscriptResult } from "./models.ts";
+import { LANGUAGES, MODELS, TARGET_LANGUAGES, type TranscriptResult } from "./models.ts";
 
-type View = "transcribe" | "settings" | "setup";
+type View = "transcribe" | "live" | "settings" | "setup";
+
+type StreamEvent = {
+  type: string;
+  text?: string;
+  scope?: string;
+  seconds?: number;
+};
+
+type LiveAudio = {
+  stream: MediaStream;
+  context: AudioContext;
+  node: AudioWorkletNode;
+};
 
 const AUDIO_TYPES = ["audio/mpeg", "audio/wav", "audio/x-wav", "audio/flac", "audio/mp4", "audio/ogg", "audio/webm", "audio/aac", "audio/x-m4a"];
 const AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".m4a", ".ogg", ".webm", ".aac", ".mp4"];
@@ -30,6 +43,23 @@ let providers: ProviderInfo[] = [];
 let dependencyReport: DependencyReport | null = null;
 let installingDeps = false;
 let isTranscribing = false;
+let liveActive = false;
+let liveSourceLanguage = "";
+let liveTargetLanguage = "en";
+let liveTranscript = "";
+let livePartial = "";
+let liveTranslation = "";
+let liveTranslationNote = "";
+let liveSocket: WebSocket | null = null;
+let liveAudio: LiveAudio | null = null;
+let liveAnalyser: AnalyserNode | null = null;
+let liveMeterFrame = 0;
+let liveHeardSeconds = 0;
+let liveServerSeconds = 0;
+let liveStreamStatus = "";
+let liveAudioWatch = 0;
+let liveStopping = false;
+let microphoneCount: number | null = null;
 let statusMessage = "Starting…";
 let statusKind: "info" | "ok" | "error" = "info";
 let serverOk = false;
@@ -47,6 +77,48 @@ function escapeHtml(value: string): string {
 function isAudioFile(file: File): boolean {
   if (AUDIO_TYPES.includes(file.type)) return true;
   return AUDIO_EXTENSIONS.some((ext) => file.name.toLowerCase().endsWith(ext));
+}
+
+function appendChunk(current: string, text: string): string {
+  const next = text.trim();
+  if (!next) return current;
+  return current ? `${current} ${next}` : next;
+}
+
+function liveModelId(): string {
+  return MODELS.some((model) => model.id === selectedModel) ? selectedModel : "small";
+}
+
+function liveModelLabel(): string {
+  return MODELS.find((model) => model.id === liveModelId())?.label ?? liveModelId();
+}
+
+function liveDeviceLabel(): string {
+  return selectedDevice === "cuda" ? "GPU" : "RAM";
+}
+
+function liveMeterLabel(): string {
+  if (!liveActive) return "Start listening and this meter shows the live microphone stream.";
+  if (liveHeardSeconds <= 0) return "Opening the microphone stream…";
+  const sent = liveHeardSeconds.toFixed(1);
+  if (liveServerSeconds > 0) return `Streaming · ${sent}s sent · ${liveServerSeconds.toFixed(1)}s received`;
+  return `Streaming · ${sent}s of microphone audio`;
+}
+
+function liveTranscriptPlaceholder(): string {
+  if (liveStreamStatus) return liveStreamStatus;
+  if (liveActive) return "Streaming… words appear here after a few seconds of speech.";
+  return "Your words will appear here as you speak.";
+}
+
+function paintStreamLabels(): void {
+  const label = document.querySelector("#live-meter-label");
+  if (label) label.textContent = liveMeterLabel();
+  const empty = document.querySelector<HTMLElement>("#live-transcript-empty");
+  if (empty && !liveTranscript && !livePartial) {
+    empty.hidden = false;
+    empty.textContent = liveTranscriptPlaceholder();
+  }
 }
 
 function fileLabel(file: File | null): string {
@@ -158,6 +230,65 @@ function renderTranscribeView(): string {
     <div class="panel">
       <div class="panel-head"><div><h2>API keys</h2><p>Add OpenAI, Deepgram, or AssemblyAI keys in Settings.</p></div></div>
       <p style="margin:0;color:var(--muted);font-size:13px">Open <button class="chip active" type="button" data-goto="settings" style="cursor:pointer">Settings</button> → API keys, paste a key, then Save.</p>
+    </div>
+  `;
+}
+
+function renderLiveView(): string {
+  const deviceLabel = liveDeviceLabel();
+  const modelLabel = liveModelLabel();
+  const transcriptEmpty = !liveTranscript && !livePartial;
+  const translationEmpty = !liveTranslation && !liveTranslationNote;
+  return `
+    <div class="view-header">
+      <h1>Live ${liveActive ? '<span class="live-dot" title="Listening"></span>' : ""}</h1>
+      <p>Speak into the microphone. Transcript and translation appear as you talk.</p>
+    </div>
+    ${microphoneCount === 0 ? `<div class="banner-inline error">No microphone is connected. Plug one in, or enable it under Windows Settings, System, Sound, Input.</div>` : ""}
+    ${selectedProvider !== "local" ? `<div class="banner-inline info">Live speech uses Local Whisper (${escapeHtml(modelLabel)}) on ${deviceLabel}. Cloud engines still apply to file transcription.</div>` : ""}
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Microphone</h2>
+          <p>Local Whisper · ${escapeHtml(modelLabel)} · ${deviceLabel}</p>
+        </div>
+      </div>
+      <div class="field-row">
+        <label>Source language
+          <select id="live-source" ${liveActive ? "disabled" : ""}>
+            ${LANGUAGES.map((language) => `<option value="${language.id}" ${language.id === liveSourceLanguage ? "selected" : ""}>${language.label}</option>`).join("")}
+          </select>
+        </label>
+        <label>Translate into
+          <select id="live-target" ${liveActive ? "disabled" : ""}>
+            ${TARGET_LANGUAGES.map((language) => `<option value="${language.id}" ${language.id === liveTargetLanguage ? "selected" : ""}>${language.label}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+      <p class="hint-text">The browser uses this PC's microphone. English translates on this PC. Any other language needs an OpenAI key in Settings.</p>
+      <div class="live-stream ${liveActive ? "on" : ""}">
+        <div id="live-meter" class="live-meter" aria-hidden="true">${Array.from({ length: 28 }, () => "<span></span>").join("")}</div>
+        <p id="live-meter-label">${liveMeterLabel()}</p>
+      </div>
+      <button id="live-toggle" class="btn btn-primary" type="button" ${liveStopping ? "disabled" : ""}>${liveActive ? "Stop listening" : liveStopping ? "Stopping…" : "Start listening"}</button>
+    </div>
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-head"><div><h2>Transcript</h2><p>Committed text, with the latest phrase in italics</p></div></div>
+        <div class="transcript-box">
+          <p id="live-transcript-empty" class="empty-state" ${transcriptEmpty ? "" : "hidden"}>${escapeHtml(liveTranscriptPlaceholder())}</p>
+          <span id="live-transcript">${escapeHtml(liveTranscript)}</span>
+          <p id="live-partial" class="live-partial">${escapeHtml(livePartial)}</p>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><div><h2>Translation</h2><p>${liveTargetLanguage ? "Translated phrases" : "Translation is off"}</p></div></div>
+        <div class="transcript-box">
+          <p id="live-translation-empty" class="empty-state" ${translationEmpty ? "" : "hidden"}>${liveTargetLanguage ? "Translation appears here after each phrase." : "Transcript only is selected."}</p>
+          <span id="live-translation">${escapeHtml(liveTranslation)}</span>
+          <p id="live-translation-note" class="live-note">${escapeHtml(liveTranslationNote)}</p>
+        </div>
+      </div>
     </div>
   `;
 }
@@ -292,6 +423,7 @@ function dependencyMessage(): string {
 function renderMainView(): string {
   if (activeView === "settings") return renderSettingsView();
   if (activeView === "setup") return renderSetupView();
+  if (activeView === "live") return renderLiveView();
   return renderTranscribeView();
 }
 
@@ -317,6 +449,9 @@ function render(options: { resetScroll?: boolean } = {}): void {
         <nav class="sidebar">
           <button class="nav-item ${activeView === "transcribe" ? "active" : ""}" data-view="transcribe" type="button">
             <span class="nav-icon">🎙</span> Transcribe
+          </button>
+          <button class="nav-item ${activeView === "live" ? "active" : ""}" data-view="live" type="button">
+            <span class="nav-icon">📡</span> Live
           </button>
           <button class="nav-item ${activeView === "settings" ? "active" : ""}" data-view="settings" type="button">
             <span class="nav-icon">⚙</span> Settings
@@ -352,17 +487,325 @@ function render(options: { resetScroll?: boolean } = {}): void {
   if (main) main.scrollTop = previousScroll;
 }
 
+function paintLive(): void {
+  const transcript = document.querySelector<HTMLElement>("#live-transcript");
+  const partial = document.querySelector<HTMLElement>("#live-partial");
+  const translation = document.querySelector<HTMLElement>("#live-translation");
+  const note = document.querySelector<HTMLElement>("#live-translation-note");
+  const transcriptEmpty = document.querySelector<HTMLElement>("#live-transcript-empty");
+  const translationEmpty = document.querySelector<HTMLElement>("#live-translation-empty");
+  if (transcript) transcript.textContent = liveTranscript;
+  if (partial) partial.textContent = livePartial;
+  if (translation) translation.textContent = liveTranslation;
+  if (note) note.textContent = liveTranslationNote;
+  if (transcriptEmpty) {
+    transcriptEmpty.hidden = Boolean(liveTranscript || livePartial);
+    if (!transcriptEmpty.hidden) transcriptEmpty.textContent = liveTranscriptPlaceholder();
+  }
+  if (translationEmpty) translationEmpty.hidden = Boolean(liveTranslation || liveTranslationNote);
+  paintStreamLabels();
+}
+
+async function refreshMicrophones(): Promise<void> {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    microphoneCount = 0;
+    return;
+  }
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  microphoneCount = devices.filter((device) => device.kind === "audioinput").length;
+}
+
+async function openMicrophone(): Promise<MediaStream> {
+  const attempts: MediaStreamConstraints[] = [
+    { audio: true },
+    {
+      audio: {
+        channelCount: { ideal: 1 },
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
+    },
+  ];
+  let lastError: unknown;
+  for (const constraints of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+      lastError = error;
+      if (error instanceof DOMException && error.name !== "OverconstrainedError") throw error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Could not start the microphone");
+}
+
+function microphoneError(error: unknown): string {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return "This page cannot use the microphone. Open Whisper UI in the browser at 127.0.0.1.";
+  }
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
+      return "Microphone blocked. Allow microphone access for this page in the browser, then try again.";
+    }
+    if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") {
+      return "No microphone is connected. Plug one in, or enable it under Windows Settings, System, Sound, Input.";
+    }
+    if (error.name === "NotReadableError") {
+      return "The microphone is in use by another app.";
+    }
+  }
+  return error instanceof Error ? error.message : "Could not start the microphone";
+}
+
+function startLiveMeter(analyser: AnalyserNode): void {
+  stopLiveMeter();
+  liveAnalyser = analyser;
+  const bins = new Uint8Array(analyser.frequencyBinCount);
+  const draw = () => {
+    liveMeterFrame = requestAnimationFrame(draw);
+    const bars = document.querySelectorAll<HTMLElement>("#live-meter span");
+    if (!bars.length || !liveAnalyser) return;
+    liveAnalyser.getByteFrequencyData(bins);
+    bars.forEach((bar, index) => {
+      const bin = bins[Math.floor((index / bars.length) * bins.length * 0.65)] ?? 0;
+      const level = 0.08 + (bin / 255) * 0.92;
+      bar.style.transform = `scaleY(${level.toFixed(3)})`;
+    });
+  };
+  draw();
+}
+
+function stopLiveMeter(): void {
+  if (liveMeterFrame) cancelAnimationFrame(liveMeterFrame);
+  liveMeterFrame = 0;
+  liveAnalyser = null;
+  window.clearTimeout(liveAudioWatch);
+  liveAudioWatch = 0;
+}
+
+function teardownLiveAudio(): void {
+  stopLiveMeter();
+  liveAudio?.stream.getTracks().forEach((track) => track.stop());
+  void liveAudio?.context.close().catch(() => undefined);
+  liveAudio = null;
+}
+
+function stopLive(sendStop = true): void {
+  const socket = liveSocket;
+  const running = liveActive || Boolean(socket) || Boolean(liveAudio);
+  if (!running) return;
+  liveActive = false;
+  teardownLiveAudio();
+  if (sendStop && socket && socket.readyState === WebSocket.OPEN) {
+    liveStopping = true;
+    socket.send(JSON.stringify({ type: "stop" }));
+    return;
+  }
+  liveStopping = false;
+  if (socket) {
+    socket.close();
+    liveSocket = null;
+  }
+}
+
+function handleStreamEvent(event: StreamEvent): void {
+  if (event.type === "ready") {
+    liveStreamStatus = "Connected. Speak and the words will stream here.";
+    paintStreamLabels();
+    setStatus("Listening…", "ok");
+    return;
+  }
+  if (event.type === "level") {
+    liveServerSeconds = Number(event.seconds ?? 0);
+    paintStreamLabels();
+    return;
+  }
+  if (event.type === "status") {
+    liveStreamStatus = event.text ?? "";
+    paintStreamLabels();
+    setStatus(liveStreamStatus, "info");
+    return;
+  }
+  if (event.type === "partial") {
+    livePartial = event.text ?? "";
+    paintLive();
+    return;
+  }
+  if (event.type === "transcript") {
+    liveTranscript = appendChunk(liveTranscript, event.text ?? "");
+    paintLive();
+    return;
+  }
+  if (event.type === "translation") {
+    liveTranslation = appendChunk(liveTranslation, event.text ?? "");
+    paintLive();
+    return;
+  }
+  if (event.type === "error") {
+    const message = event.text ?? "Live transcription failed";
+    if (event.scope === "translation") {
+      liveTranslationNote = message;
+      paintLive();
+      setStatus(message, "info");
+      return;
+    }
+    setStatus(message, "error");
+    stopLive(false);
+    if (activeView === "live") render();
+    return;
+  }
+  if (event.type === "stopped") {
+    livePartial = "";
+    liveActive = false;
+    liveStopping = false;
+    paintLive();
+    const socket = liveSocket;
+    liveSocket = null;
+    socket?.close();
+    if (activeView === "live") render();
+    setStatus("Live session ended.", "ok");
+  }
+}
+
+async function startLive(context: AudioContext): Promise<void> {
+  if (liveActive || liveSocket || liveStopping) {
+    void context.close();
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    void context.close();
+    setStatus("This page cannot use the microphone. Open Whisper UI in the browser at 127.0.0.1.", "error");
+    return;
+  }
+
+  setStatus("Allow the microphone in the browser prompt…", "info");
+  let stream: MediaStream;
+  try {
+    stream = await openMicrophone();
+  } catch (error) {
+    void context.close();
+    microphoneCount = 0;
+    setStatus(microphoneError(error), "error");
+    if (activeView === "live") render();
+    return;
+  }
+
+  liveTranscript = "";
+  livePartial = "";
+  liveTranslation = "";
+  liveTranslationNote = "";
+  liveHeardSeconds = 0;
+  liveServerSeconds = 0;
+  liveStreamStatus = "Opening the microphone stream…";
+  liveActive = true;
+  render();
+  setStatus("Connecting microphone…", "info");
+
+  try {
+    if (context.state === "suspended") await context.resume();
+    if (context.state !== "running") {
+      throw new Error("The browser blocked the microphone stream. Click Start listening again.");
+    }
+    if (!liveActive) {
+      stream.getTracks().forEach((track) => track.stop());
+      await context.close();
+      return;
+    }
+    await context.audioWorklet.addModule("/pcm-worklet.js");
+    if (!liveActive) {
+      stream.getTracks().forEach((track) => track.stop());
+      await context.close();
+      return;
+    }
+    const source = context.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(context, "pcm-capture");
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 128;
+    analyser.smoothingTimeConstant = 0.75;
+    const silent = context.createGain();
+    silent.gain.value = 0;
+    source.connect(node);
+    source.connect(analyser);
+    node.connect(silent);
+    silent.connect(context.destination);
+    startLiveMeter(analyser);
+    liveAudio = { stream, context, node };
+
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${proto}://${location.host}/api/stream`);
+    liveSocket = socket;
+    socket.addEventListener("open", () => {
+      socket.send(JSON.stringify({
+        type: "start",
+        model: liveModelId(),
+        language: liveSourceLanguage,
+        targetLanguage: liveTargetLanguage,
+        device: selectedDevice,
+      }));
+      node.port.onmessage = (message: MessageEvent<ArrayBuffer>) => {
+        const bytes = message.data.byteLength;
+        liveHeardSeconds += bytes / 2 / 16000;
+        paintStreamLabels();
+        if (socket.readyState === WebSocket.OPEN) socket.send(message.data);
+      };
+      window.clearTimeout(liveAudioWatch);
+      liveAudioWatch = window.setTimeout(() => {
+        if (liveActive && liveHeardSeconds < 0.2) {
+          liveStreamStatus = "No audio is streaming from the microphone.";
+          paintStreamLabels();
+          setStatus(liveStreamStatus, "error");
+        }
+      }, 2500);
+    });
+    socket.addEventListener("message", (message: MessageEvent<string>) => {
+      if (typeof message.data !== "string") return;
+      try {
+        handleStreamEvent(JSON.parse(message.data) as StreamEvent);
+      } catch {
+        setStatus("Could not read the live stream.", "error");
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (liveSocket !== socket) return;
+      const unexpected = liveActive;
+      const wasStopping = liveStopping;
+      liveSocket = null;
+      liveActive = false;
+      liveStopping = false;
+      teardownLiveAudio();
+      if ((unexpected || wasStopping) && activeView === "live") render();
+      if (unexpected && statusKind !== "error") setStatus("Live session ended.", "info");
+      else if (wasStopping && statusKind !== "error") setStatus("Live session ended.", "ok");
+    });
+    socket.addEventListener("error", () => {
+      setStatus("Could not connect to the live stream.", "error");
+    });
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    teardownLiveAudio();
+    void context.close().catch(() => undefined);
+    liveSocket?.close();
+    liveSocket = null;
+    liveActive = false;
+    render();
+    setStatus(microphoneError(error), "error");
+  }
+}
+
 function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      activeView = (btn.dataset.view as View) ?? "transcribe";
+      const next = (btn.dataset.view as View) ?? "transcribe";
+      if (next !== "live") stopLive(true);
+      activeView = next;
       render({ resetScroll: true });
     });
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-goto]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      activeView = (btn.dataset.goto as View) ?? "transcribe";
+      const next = (btn.dataset.goto as View) ?? "transcribe";
+      if (next !== "live") stopLive(true);
+      activeView = next;
       render({ resetScroll: true });
     });
   });
@@ -469,6 +912,27 @@ function bindEvents(): void {
     setStatus("Copied to clipboard.", "ok");
   });
 
+  document.querySelector<HTMLSelectElement>("#live-source")?.addEventListener("change", (event) => {
+    liveSourceLanguage = (event.target as HTMLSelectElement).value;
+  });
+
+  document.querySelector<HTMLSelectElement>("#live-target")?.addEventListener("change", (event) => {
+    liveTargetLanguage = (event.target as HTMLSelectElement).value;
+    if (activeView === "live" && !liveActive) render();
+  });
+
+  document.querySelector("#live-toggle")?.addEventListener("click", () => {
+    if (liveActive) {
+      stopLive(true);
+      render();
+      setStatus("Stopping…", "info");
+      return;
+    }
+    const context = new AudioContext();
+    void context.resume();
+    void startLive(context);
+  });
+
   document.querySelector("#run")?.addEventListener("click", async () => {
     if (!selectedFile) { setStatus("Choose an audio file first.", "error"); return; }
     const provider = currentProvider();
@@ -537,6 +1001,12 @@ async function boot(): Promise<void> {
 
     syncModelForProvider();
     if (selectedDevice === "cuda" && modelNeedsRam(currentModelMeta())) selectedDevice = "cpu";
+    await refreshMicrophones().catch(() => undefined);
+    navigator.mediaDevices?.addEventListener("devicechange", () => {
+      void refreshMicrophones().then(() => {
+        if (activeView === "live" && !liveActive) render();
+      }).catch(() => undefined);
+    });
 
     if (dependencyReport && !dependencyReport.ready) {
       setStatus("Setup required — open Setup to install dependencies.", "error");

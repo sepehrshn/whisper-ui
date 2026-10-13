@@ -55,3 +55,8 @@ export const LANGUAGES = [
   { id: "ru", label: "Russian" },
   { id: "tr", label: "Turkish" },
 ];
+
+export const TARGET_LANGUAGES = [
+  { id: "", label: "Transcript only" },
+  ...LANGUAGES.filter((language) => language.id),
+];

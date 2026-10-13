@@ -66,7 +66,14 @@ def _find_browser() -> list[list[str]]:
         ]
         for path in edge_paths + chrome_paths:
             if path.is_file():
-                candidates.append([str(path), f"--app={url}", "--window-size=1280,800"])
+                # Auto-allow the mic in this app window so Live can capture it.
+                # The flag applies only to this process, and it uses the real microphone.
+                candidates.append([
+                    str(path),
+                    f"--app={url}",
+                    "--window-size=1280,800",
+                    "--use-fake-ui-for-media-stream",
+                ])
                 break
 
     return candidates
